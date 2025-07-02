@@ -1,0 +1,25 @@
+# 開発環境用のオーバーライド設定
+services:
+  stratify-s3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: build  # ビルドステージで停止（ホットリロード用）
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - DOTNET_USE_POLLING_FILE_WATCHER=true
+      - Logging__LogLevel__Default=Debug
+      - Logging__LogLevel__Microsoft.AspNetCore=Information
+    volumes:
+      # ソースコードをマウント（ホットリロード用）
+      - ./src:/src
+      - /src/bin
+      - /src/obj
+      # ローカルストレージ
+      - ./storage/primary:/storage/primary
+      - ./storage/secondary:/storage/secondary
+      - ./storage/archive:/storage/archive
+    command: dotnet watch run --no-launch-profile
+    ports:
+      - "5000:8080"
+      - "5001:8081"  # HTTPSポート（開発用）
