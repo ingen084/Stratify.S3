@@ -10,6 +10,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 BASE_URL="http://localhost:5000"
+ADMIN_KEY="admin-api-key-secure"  # デフォルトの管理APIキー
 
 echo -e "${BLUE}=== Stratify.S3 フェイルオーバーテスト ===${NC}"
 echo ""
@@ -40,7 +41,7 @@ show_help() {
 # バックエンドステータス表示
 show_status() {
     echo -e "${YELLOW}バックエンドステータス:${NC}"
-    curl -s "$BASE_URL/admin/backends" | jq -r '.[] | "\(.name): \(.status) (Priority: \(.priority))"' 2>/dev/null || echo "エラー: Stratify.S3が起動していないか、jqがインストールされていません"
+    curl -s -H "X-Admin-Key: $ADMIN_KEY" "$BASE_URL/admin/backends" | jq -r '.[] | "\(.name): \(.status) (Priority: \(.priority))"' 2>/dev/null || echo "エラー: Stratify.S3が起動していないか、jqがインストールされていません、または認証に失敗しました"
     echo ""
 }
 
@@ -53,7 +54,7 @@ disable_backend() {
     fi
     
     echo -e "${YELLOW}バックエンド '$backend_name' を無効化中...${NC}"
-    response=$(curl -s -X POST "$BASE_URL/admin/backend/$backend_name/disable")
+    response=$(curl -s -X POST -H "X-Admin-Key: $ADMIN_KEY" "$BASE_URL/admin/backend/$backend_name/disable")
     success=$(echo "$response" | jq -r '.success' 2>/dev/null)
     message=$(echo "$response" | jq -r '.message' 2>/dev/null)
     
@@ -74,7 +75,7 @@ enable_backend() {
     fi
     
     echo -e "${YELLOW}バックエンド '$backend_name' を有効化中...${NC}"
-    response=$(curl -s -X POST "$BASE_URL/admin/backend/$backend_name/enable")
+    response=$(curl -s -X POST -H "X-Admin-Key: $ADMIN_KEY" "$BASE_URL/admin/backend/$backend_name/enable")
     success=$(echo "$response" | jq -r '.success' 2>/dev/null)
     message=$(echo "$response" | jq -r '.message' 2>/dev/null)
     

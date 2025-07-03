@@ -17,7 +17,7 @@ services:
       - secondary-storage:/storage/secondary
       - archive-storage:/storage/archive
       # 設定ファイルのオーバーライド（オプション）
-      - ./src/appsettings.Production.json:/app/appsettings.Production.json:ro
+      #- ./src/appsettings.Production.json:/app/appsettings.Production.json:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

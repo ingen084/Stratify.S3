@@ -237,6 +237,37 @@ public class AuthenticationService
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
+    public Task<AuthResult> AuthenticateAdminAsync(HttpContext context)
+    {
+        if (!_authConfig.Enabled)
+        {
+            return Task.FromResult(AuthResult.Success());
+        }
+
+        var apiKeyHeader = context.Request.Headers["X-Admin-Key"].FirstOrDefault();
+        
+        // 管理APIキー認証のみをサポート
+        if (string.IsNullOrEmpty(apiKeyHeader))
+        {
+            _logger.LogWarning("管理APIキーが提供されていません");
+            return Task.FromResult(AuthResult.Failure("Admin API key required"));
+        }
+
+        var keyConfig = _authConfig.ApiKeys.FirstOrDefault(k => 
+            k.Key == apiKeyHeader && 
+            k.Enabled && 
+            IsOperationAllowed(k.AllowedOperations, "admin"));
+            
+        if (keyConfig == null)
+        {
+            _logger.LogWarning("無効な管理APIキーが提供されました");
+            return Task.FromResult(AuthResult.Failure("Invalid admin API key"));
+        }
+
+        _logger.LogInformation("管理APIキー認証が成功しました: {KeyName}", keyConfig.Name);
+        return Task.FromResult(AuthResult.Success(keyConfig.Name));
+    }
+
     private string GetOperationFromRequest(HttpRequest request)
     {
         return request.Method.ToLowerInvariant() switch

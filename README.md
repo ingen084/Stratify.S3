@@ -152,12 +152,42 @@ aws --endpoint-url http://localhost:5000 s3 cp s3://mybucket/file.txt ./
 
 ### 管理エンドポイント
 
+管理エンドポイントはAPIキー認証で保護されています（認証が有効な場合）。
+
 ```bash
-# ヘルスチェック
+# ヘルスチェック（認証不要）
 curl http://localhost:5000/health
 
-# 手動復旧トリガー
-curl -X POST http://localhost:5000/admin/recovery
+# 手動復旧トリガー（認証が必要）
+curl -X POST -H "X-Admin-Key: admin-api-key-secure" http://localhost:5000/admin/recovery
+
+# バックエンド無効化
+curl -X POST -H "X-Admin-Key: admin-api-key-secure" http://localhost:5000/admin/backend/primary/disable
+
+# バックエンド有効化
+curl -X POST -H "X-Admin-Key: admin-api-key-secure" http://localhost:5000/admin/backend/primary/enable
+
+# バックエンドステータス確認
+curl -H "X-Admin-Key: admin-api-key-secure" http://localhost:5000/admin/backends
+```
+
+#### 管理API認証設定
+
+```json
+{
+  "Authentication": {
+    "Enabled": true,
+    "ApiKeys": [
+      {
+        "Name": "admin-api",
+        "Key": "your-secure-admin-key",
+        "AllowedOperations": ["admin"],
+        "AllowedBuckets": ["*"],
+        "Enabled": true
+      }
+    ]
+  }
+}
 ```
 
 ## アーキテクチャ
