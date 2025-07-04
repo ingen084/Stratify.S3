@@ -8,10 +8,10 @@ Stratify.S3は、複数のファイルシステムストレージを単一のS3�
 
 ### 主な機能
 
-- **S3互換API**: 基本的なS3操作をサポート（ListBuckets, ListObjects, GetObject, PutObject, DeleteObject）
+- **S3互換API**: 基本的なS3操作をサポート（ListBuckets, CreateBucket, DeleteBucket, ListObjects, GetObject, PutObject, DeleteObject）
+- **S3マルチパートアップロード**: 大きなファイルの効率的なアップロードをサポート
 - **レイヤードストレージ**: 複数のバックエンドストレージを優先度順で管理
 - **自動フェイルオーバー**: プライマリストレージが利用不可の場合、自動的にセカンダリストレージにフォールバック
-- **フェイルオーバー機能**: プライマリ障害時にセカンダリストレージへ自動フォールバック
 - **自動復旧**: より新しいファイルを優先度の高いストレージに自動的に復旧
 - **ヘルスチェック**: 各バックエンドの可用性を定期的に監視
 - **Range対応**: 部分的なファイル取得をサポート
@@ -115,9 +115,13 @@ aws --endpoint-url http://localhost:5000 s3 ls
     "RecoveryTimeout": 300,           // 復旧タイムアウト（秒）
     "ChunkSize": 8192,                // ストリーミング時のチャンクサイズ
     "MaxFileSize": 10737418240,       // 最大ファイルサイズ（10GB）
-    "AutoRecoveryEnabled": true,      // 自動復旧の有効/無効
     "RecoveryCheckInterval": 300,     // 復旧チェック間隔（秒）
     "RecoveryBatchSize": 10          // 一度に処理する復旧ファイル数
+  },
+  "MultipartUpload": {
+    "TempDirectory": "/tmp/stratify-s3-multipart",  // 一時ファイル保存先
+    "CleanupInterval": 3600,          // クリーンアップ間隔（秒）
+    "ExpirationHours": 24             // アップロードの有効期限（時間）
   },
   "Backends": [
     {
@@ -145,6 +149,9 @@ aws --endpoint-url http://localhost:5000 s3 mb s3://mybucket
 
 # ファイルアップロード
 aws --endpoint-url http://localhost:5000 s3 cp file.txt s3://mybucket/
+
+# 大きなファイルのアップロード（自動的にマルチパートアップロードが使用される）
+aws --endpoint-url http://localhost:5000 s3 cp large-file.zip s3://mybucket/
 
 # ファイルダウンロード
 aws --endpoint-url http://localhost:5000 s3 cp s3://mybucket/file.txt ./
@@ -190,6 +197,38 @@ curl -H "X-Admin-Key: admin-api-key-secure" http://localhost:5000/admin/backends
 }
 ```
 
+## S3マルチパートアップロード
+
+Stratify.S3は、S3互換のマルチパートアップロードをフルサポートしています。
+
+### サポートされているAPI
+
+- `POST /{bucket}/{key}?uploads` - マルチパートアップロード開始
+- `PUT /{bucket}/{key}?partNumber=X&uploadId=Y` - パートアップロード
+- `POST /{bucket}/{key}?uploadId=X` - マルチパートアップロード完了
+- `DELETE /{bucket}/{key}?uploadId=X` - マルチパートアップロード中断
+- `GET /{bucket}/{key}?uploadId=X` - アップロード済みパート一覧
+
+### 特徴
+
+- **既存フェイルオーバー機能との統合**: 完了時に既存の`WriteFileWithFallbackAsync`を使用してストレージ階層を活用
+- **高性能**: パートごとの並列アップロード対応
+- **整合性保証**: 各パートでMD5ハッシュによる整合性チェック
+- **自動クリーンアップ**: 期限切れのマルチパートアップロードを自動削除
+- **S3完全互換**: AWS SDK、aws-cli、サードパーティツールから利用可能
+
+### 使用例
+
+```bash
+# AWS CLI - 大きなファイルは自動的にマルチパートアップロードが使用される
+aws --endpoint-url http://localhost:5000 s3 cp large-file.zip s3://mybucket/
+
+# Python boto3
+import boto3
+s3 = boto3.client('s3', endpoint_url='http://localhost:5000')
+s3.upload_file('large-file.zip', 'mybucket', 'large-file.zip')
+```
+
 ## アーキテクチャ
 
 ### ストレージ階層
@@ -220,6 +259,33 @@ curl -H "X-Admin-Key: admin-api-key-secure" http://localhost:5000/admin/backends
 - 優先度の高いストレージに自動的に移動（元ファイルは削除）
 - MD5ハッシュによるファイル内容の整合性検証で安全な転送を保証
 - トランザクショナルな操作でデータ損失を防止
+
+## テスト
+
+### 結合テスト
+
+AWS CLIを使用した包括的な結合テストが利用可能です：
+
+```bash
+# テストセットアップ
+cd tests/integration
+
+# 全テストの実行
+./run-all-tests.sh
+
+# 個別テストの実行
+./test-basic-operations.sh      # 基本操作
+./test-multipart-upload.sh      # マルチパートアップロード
+./test-failover.sh              # フェイルオーバー
+```
+
+テストカバレッジ：
+- **基本操作**: バケット・オブジェクトの CRUD 操作
+- **マルチパートアップロード**: 大きなファイルの分割アップロード
+- **フェイルオーバー**: バックエンド障害時の動作
+- **管理API**: ヘルスチェック、手動復旧、バックエンド制御
+
+詳細は [tests/integration/README.md](tests/integration/README.md) を参照してください。
 
 ## パフォーマンスチューニング
 

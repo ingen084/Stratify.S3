@@ -1,6 +1,7 @@
 # Stratify.S3 開発ガイド
 
 このドキュメントは、Claude AIアシスタントがStratify.S3プロジェクトを効率的に理解し、開発をサポートするための情報を提供します。
+作業の際は、思いついた方法が正しいかどうか、結論が出てもその結論が完全に確信を持てるまで繰り返し再検討して進めてください。
 
 ## プロジェクト概要
 
@@ -125,17 +126,105 @@ dotnet analyzers
 - プライマリストレージが使用可能な場合、削除操作はプライマリで成功する必要がある
 - プライマリストレージのアクセス権限とディスク容量を確認
 
+## S3マルチパートアップロード（実装済み）
+
+Stratify.S3は、S3互換のマルチパートアップロードAPIに対応しています。
+
+### 対応API
+- `POST /{bucket}/{key}?uploads` - マルチパートアップロード開始
+- `PUT /{bucket}/{key}?partNumber=X&uploadId=Y` - パートアップロード
+- `POST /{bucket}/{key}?uploadId=X` - マルチパートアップロード完了
+- `DELETE /{bucket}/{key}?uploadId=X` - マルチパートアップロード中断
+- `GET /{bucket}/{key}?uploadId=X` - アップロード済みパート一覧
+
+### 設定項目
+```json
+{
+  "MultipartUpload": {
+    "TempDirectory": "/tmp/stratify-s3-multipart",
+    "CleanupInterval": 3600,
+    "ExpirationHours": 24
+  }
+}
+```
+
+### 特徴
+- **既存フェイルオーバー機能との統合**: 完了時に`WriteFileWithFallbackAsync`を使用
+- **ETag統一**: メタデータベース方式でパフォーマンス重視
+- **パート検証**: 各パートでMD5ハッシュによる整合性チェック
+- **自動クリーンアップ**: 期限切れのマルチパートアップロードを自動削除
+- **S3互換**: AWS SDKやaws-cliから利用可能
+
+### 使用例
+```bash
+# AWS CLI例
+aws s3 cp large-file.zip s3://mybucket/path/to/file.zip \
+    --endpoint-url http://localhost:5000
+
+# 大きなファイルは自動的にマルチパートアップロードが使用される
+```
+
 ## 今後の改善案
 
-1. **S3 Multipart Upload対応**: 大きなファイルの効率的なアップロード
-2. **メトリクス収集**: Prometheus/OpenTelemetry統合
-3. **認証・認可**: S3署名検証の実装
-4. **圧縮転送**: gzip/brotli対応
-5. **イベント通知**: ファイル変更時のWebhook/メッセージング
+1. **メトリクス収集**: Prometheus/OpenTelemetry統合
+2. **認証・認可**: S3署名検証の実装
+3. **圧縮転送**: gzip/brotli対応
+4. **イベント通知**: ファイル変更時のWebhook/メッセージング
+5. **マルチパート最適化**: チャンクサイズの動的調整
+
+## テストとデバッグ
+
+### 結合テスト
+
+AWS CLIを使用した包括的な結合テストが利用可能です：
+
+```bash
+# プロジェクトルートから
+cd tests/integration
+
+# サーバー起動（別ターミナル）
+dotnet run --project ../../src/Stratify.S3.csproj
+
+# 全テスト実行
+./run-all-tests.sh
+
+# 個別テスト実行
+./test-basic-operations.sh      # 基本S3操作
+./test-multipart-upload.sh      # マルチパートアップロード
+./test-failover.sh              # フェイルオーバー・管理API
+```
+
+### テストカバレッジ
+
+- **基本操作**: ListBuckets, CreateBucket, DeleteBucket, PutObject, GetObject, DeleteObject
+- **マルチパートアップロード**: 全API（Initiate, UploadPart, Complete, Abort, ListParts）
+- **フェイルオーバー**: バックエンド障害シミュレーション
+- **管理機能**: ヘルスチェック、手動復旧、バックエンド制御
+- **整合性**: ファイル内容のMD5検証
+- **パフォーマンス**: アップロード・ダウンロード時間の計測
+
+### デバッグガイド
+
+```bash
+# 詳細ログでサーバー起動
+ASPNETCORE_ENVIRONMENT=Development dotnet run --project src/
+
+# テスト一時ファイルの確認
+ls -la tests/integration/temp/
+ls -la tests/integration/test-data/
+
+# 特定テストのデバッグ実行
+set -x
+./test-multipart-upload.sh
+set +x
+```
 
 ## リリース手順
 
 ```bash
+# テスト実行
+cd tests/integration && ./run-all-tests.sh
+
 # リリースビルド
 dotnet publish -c Release -o ./publish
 

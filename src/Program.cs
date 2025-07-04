@@ -12,6 +12,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<FileValidationService>();
 builder.Services.AddSingleton<BackendManager>();
 builder.Services.AddSingleton<AuthenticationService>();
+builder.Services.AddSingleton<MultipartUploadManager>();
 builder.Services.AddHostedService<RecoveryHostedService>();
 builder.Services.AddLogging();
 
@@ -28,6 +29,7 @@ app.UseMiddleware<AuthenticationMiddleware>();
 
 // Get services
 var backendManager = app.Services.GetRequiredService<BackendManager>();
+var multipartUploadManager = app.Services.GetRequiredService<MultipartUploadManager>();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
 var config = app.Configuration.GetSection("AppSettings").Get<AppConfiguration>() ?? new AppConfiguration();
 
@@ -136,8 +138,7 @@ app.MapGet("/{bucket}", async (string bucket, string? prefix, string? delimiter,
         {
             try
             {
-                var etagContent = $"{fileObject.Key}:{fileObject.Size}:{fileObject.LastModified.Ticks}";
-                var etag = Convert.ToHexString(MD5.HashData(Encoding.UTF8.GetBytes(etagContent))).ToLower();
+                var etag = ETagService.ComputeETag(fileObject.Key, fileObject.Size, fileObject.LastModified);
                 objects.Add((fileObject.Key, fileObject.Size, fileObject.LastModified, etag));
             }
             catch (Exception ex)
@@ -162,11 +163,86 @@ app.MapGet("/{bucket}", async (string bucket, string? prefix, string? delimiter,
     }
 });
 
-// GetObject
+// HeadObject - explicit mapping
+app.MapMethods("/{bucket}/{**key}", ["HEAD"], async (string bucket, string key, HttpContext context) =>
+{
+    bucket = HttpUtility.UrlDecode(bucket);
+    key = HttpUtility.UrlDecode(key);
+    
+    logger.LogInformation("Processing HEAD request for {Bucket}/{Key}", bucket, key);
+    var relativePath = Path.Combine(bucket, key);
+    var fileLocation = await backendManager.FindFileWithFallbackAsync(relativePath);
+    if (fileLocation == null)
+    {
+        context.Response.StatusCode = 404;
+        return Results.Empty;
+    }
+
+    var fileInfo = new FileInfo(fileLocation.Path);
+    var etag = ETagService.ComputeETag(fileInfo, key);
+
+    context.Response.Headers.ETag = $"\"{etag}\"";
+    context.Response.Headers.LastModified = fileInfo.LastWriteTimeUtc.ToString("R");
+    context.Response.Headers.AcceptRanges = "bytes";
+    context.Response.Headers.ContentLength = fileInfo.Length;
+    context.Response.Headers.ContentType = "application/octet-stream";
+
+    return Results.Empty;
+});
+
+// GetObject / ListParts
 app.MapGet("/{bucket}/{**key}", async (string bucket, string key, HttpContext context) =>
 {
     bucket = HttpUtility.UrlDecode(bucket);
     key = HttpUtility.UrlDecode(key);
+    
+    // Check if this is a List Parts request
+    if (context.Request.Query.ContainsKey("uploadId"))
+    {
+        var uploadId = context.Request.Query["uploadId"].ToString();
+        var upload = multipartUploadManager.GetUpload(uploadId);
+        
+        if (upload == null)
+        {
+            return Results.Content(
+                S3XmlHelper.CreateErrorResponse("NoSuchUpload", "指定されたマルチパートアップロードは存在しません", $"/{bucket}/{key}"),
+                "application/xml",
+                statusCode: 404
+            );
+        }
+
+        var partNumberMarker = 0;
+        if (context.Request.Query.ContainsKey("part-number-marker"))
+        {
+            int.TryParse(context.Request.Query["part-number-marker"], out partNumberMarker);
+        }
+
+        var maxParts = 1000;
+        if (context.Request.Query.ContainsKey("max-parts"))
+        {
+            int.TryParse(context.Request.Query["max-parts"], out maxParts);
+            maxParts = Math.Min(Math.Max(maxParts, 1), 1000);
+        }
+
+        var parts = multipartUploadManager.GetParts(uploadId);
+        var filteredParts = parts.Where(p => p.PartNumber > partNumberMarker).Take(maxParts + 1).ToList();
+        
+        var isTruncated = filteredParts.Count > maxParts;
+        if (isTruncated)
+        {
+            filteredParts = filteredParts.Take(maxParts).ToList();
+        }
+
+        var nextPartNumberMarker = isTruncated && filteredParts.Any() ? filteredParts.Last().PartNumber : 0;
+        
+        return Results.Content(
+            S3XmlHelper.CreateListPartsResponse(
+                bucket, key, uploadId, partNumberMarker, nextPartNumberMarker, 
+                maxParts, isTruncated, filteredParts),
+            "application/xml"
+        );
+    }
+    
     var relativePath = Path.Combine(bucket, key);
 
     var fileLocation = await backendManager.FindFileWithFallbackAsync(relativePath);
@@ -207,8 +283,7 @@ app.MapGet("/{bucket}/{**key}", async (string bucket, string key, HttpContext co
         }
     }
 
-    var etagContent = $"{key}:{fileSize}:{fileInfo.LastWriteTimeUtc.Ticks}";
-    var etag = Convert.ToHexString(MD5.HashData(Encoding.UTF8.GetBytes(etagContent))).ToLower();
+    var etag = ETagService.ComputeETag(fileInfo, key);
 
     context.Response.Headers.ETag = $"\"{etag}\"";
     context.Response.Headers.LastModified = fileInfo.LastWriteTimeUtc.ToString("R");
@@ -240,11 +315,105 @@ app.MapGet("/{bucket}/{**key}", async (string bucket, string key, HttpContext co
     return Results.Empty;
 });
 
-// PutObject
+// Create Bucket (must be before PutObject endpoint)
+app.MapPut("/{bucket:regex(^[a-z0-9.-]{{3,63}}$)}", async (string bucket, HttpContext context) =>
+{
+    // Ensure this is a bucket creation request (no additional path segments)
+    var path = context.Request.Path.Value;
+    if (path != null && path.Count(c => c == '/') == 1) // Only one slash (bucket name only)
+    {
+        try
+        {
+            logger.LogInformation("Creating bucket: {Bucket}", bucket);
+            
+            // Check if bucket already exists
+            var existingBuckets = await backendManager.GetAllBucketsAsync();
+            if (existingBuckets.Contains(bucket))
+            {
+                // S3 behavior: return 200 if bucket exists and you own it
+                return Results.Ok();
+            }
+            
+            // Create bucket directory in available backends
+            var availableBackends = await backendManager.GetAvailableBackendsAsync();
+            if (availableBackends.Count == 0)
+            {
+                return Results.Content(
+                    S3XmlHelper.CreateErrorResponse("ServiceUnavailable", "利用可能なバックエンドがありません", $"/{bucket}"),
+                    "application/xml",
+                    statusCode: 503
+                );
+            }
+            
+            // Create bucket in primary backend (highest priority available)
+            var primaryBackend = availableBackends.OrderBy(b => b.Priority).First();
+            var bucketPath = Path.Combine(primaryBackend.Path, bucket);
+            
+            Directory.CreateDirectory(bucketPath);
+            
+            logger.LogInformation("Successfully created bucket {Bucket} in backend {Backend}", bucket, primaryBackend.Name);
+            return Results.Ok();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to create bucket {Bucket}", bucket);
+            return Results.Content(
+                S3XmlHelper.CreateErrorResponse("InternalError", "バケットの作成に失敗しました", $"/{bucket}"),
+                "application/xml",
+                statusCode: 500
+            );
+        }
+    }
+    
+    return Results.NotFound();
+});
+
+// PutObject / UploadPart
 app.MapPut("/{bucket}/{**key}", async (string bucket, string key, HttpContext context) =>
 {
     bucket = HttpUtility.UrlDecode(bucket);
     key = HttpUtility.UrlDecode(key);
+
+    // Check if this is an Upload Part request
+    var query = context.Request.Query;
+    if (query.ContainsKey("partNumber") && query.ContainsKey("uploadId"))
+    {
+        var uploadId = query["uploadId"].ToString();
+        if (!int.TryParse(query["partNumber"], out var partNumber) || partNumber < 1 || partNumber > 10000)
+        {
+            return Results.Content(
+                S3XmlHelper.CreateErrorResponse("InvalidArgument", "パート番号は1から10000の間である必要があります", $"/{bucket}/{key}"),
+                "application/xml",
+                statusCode: 400
+            );
+        }
+
+        var upload = multipartUploadManager.GetUpload(uploadId);
+        if (upload == null)
+        {
+            return Results.Content(
+                S3XmlHelper.CreateErrorResponse("NoSuchUpload", "指定されたマルチパートアップロードは存在しません", $"/{bucket}/{key}"),
+                "application/xml",
+                statusCode: 404
+            );
+        }
+
+        using var memoryStream = new MemoryStream();
+        await context.Request.Body.CopyToAsync(memoryStream);
+        var data = memoryStream.ToArray();
+
+        if (multipartUploadManager.AddPart(uploadId, partNumber, data, out var etag))
+        {
+            context.Response.Headers.ETag = $"\"{etag}\"";
+            return Results.Ok();
+        }
+
+        return Results.Content(
+            S3XmlHelper.CreateErrorResponse("InternalError", "パートのアップロードに失敗しました", $"/{bucket}/{key}"),
+            "application/xml",
+            statusCode: 500
+        );
+    }
 
     try
     {
@@ -278,7 +447,7 @@ app.MapPut("/{bucket}/{**key}", async (string bucket, string key, HttpContext co
         }
         
         // Generate ETag
-        var etag = Convert.ToHexString(MD5.HashData(content)).ToLower();
+        var etag = ETagService.ComputeETag(key, content.Length, DateTime.UtcNow);
 
         context.Response.Headers.ETag = $"\"{etag}\"";
         return Results.Ok();
@@ -295,11 +464,113 @@ app.MapPut("/{bucket}/{**key}", async (string bucket, string key, HttpContext co
     }
 });
 
-// DeleteObject
-app.MapDelete("/{bucket}/{**key}", async (string bucket, string key) =>
+// Delete Bucket (must be before DeleteObject endpoint)
+app.MapDelete("/{bucket:regex(^[a-z0-9.-]{{3,63}}$)}", async (string bucket, HttpContext context) =>
+{
+    // Ensure this is a bucket deletion request (no additional path segments)
+    var path = context.Request.Path.Value;
+    if (path != null && path.Count(c => c == '/') == 1) // Only one slash (bucket name only)
+    {
+        try
+        {
+            logger.LogInformation("Deleting bucket: {Bucket}", bucket);
+            
+            // Check if bucket exists
+            var existingBuckets = await backendManager.GetAllBucketsAsync();
+            if (!existingBuckets.Contains(bucket))
+            {
+                return Results.Content(
+                    S3XmlHelper.CreateErrorResponse("NoSuchBucket", "指定されたバケットは存在しません", $"/{bucket}"),
+                    "application/xml",
+                    statusCode: 404
+                );
+            }
+            
+            // Check if bucket is empty by checking all backends
+            bool bucketHasFiles = false;
+            var backends = await backendManager.GetAvailableBackendsAsync();
+            
+            foreach (var backend in backends)
+            {
+                var bucketPath = Path.Combine(backend.Path, bucket);
+                if (Directory.Exists(bucketPath))
+                {
+                    var files = Directory.GetFiles(bucketPath, "*", SearchOption.AllDirectories);
+                    if (files.Length > 0)
+                    {
+                        bucketHasFiles = true;
+                        break;
+                    }
+                }
+            }
+            
+            if (bucketHasFiles)
+            {
+                return Results.Content(
+                    S3XmlHelper.CreateErrorResponse("BucketNotEmpty", "バケットが空ではないため削除できません", $"/{bucket}"),
+                    "application/xml",
+                    statusCode: 409
+                );
+            }
+            
+            // Delete bucket from all backends
+            foreach (var backend in backends)
+            {
+                var bucketPath = Path.Combine(backend.Path, bucket);
+                if (Directory.Exists(bucketPath))
+                {
+                    try
+                    {
+                        Directory.Delete(bucketPath, false); // false = don't delete if not empty
+                        logger.LogInformation("Deleted bucket {Bucket} from backend {Backend}", bucket, backend.Name);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Failed to delete bucket {Bucket} from backend {Backend}", bucket, backend.Name);
+                    }
+                }
+            }
+            
+            logger.LogInformation("Successfully deleted bucket {Bucket}", bucket);
+            return Results.NoContent();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to delete bucket {Bucket}", bucket);
+            return Results.Content(
+                S3XmlHelper.CreateErrorResponse("InternalError", "バケットの削除に失敗しました", $"/{bucket}"),
+                "application/xml",
+                statusCode: 500
+            );
+        }
+    }
+    
+    return Results.NotFound();
+});
+
+// DeleteObject / AbortMultipartUpload
+app.MapDelete("/{bucket}/{**key}", async (string bucket, string key, HttpContext context) =>
 {
     bucket = HttpUtility.UrlDecode(bucket);
     key = HttpUtility.UrlDecode(key);
+    
+    // Check if this is an Abort Multipart Upload request
+    if (context.Request.Query.ContainsKey("uploadId"))
+    {
+        var uploadId = context.Request.Query["uploadId"].ToString();
+        
+        if (multipartUploadManager.AbortUpload(uploadId))
+        {
+            return Results.NoContent();
+        }
+
+        return Results.Content(
+            S3XmlHelper.CreateErrorResponse("NoSuchUpload", "指定されたマルチパートアップロードは存在しません", $"/{bucket}/{key}"),
+            "application/xml",
+            statusCode: 404
+        );
+    }
+    
     var relativePath = Path.Combine(bucket, key);
 
     // Delete with fallback
@@ -375,6 +646,129 @@ app.MapGet("/admin/backends", async () =>
 {
     var status = await backendManager.GetBackendStatusAsync();
     return Results.Ok(status);
+});
+
+// Initiate Multipart Upload / Complete Multipart Upload
+app.MapPost("/{bucket}/{**key}", async (string bucket, string key, HttpContext context) =>
+{
+    bucket = HttpUtility.UrlDecode(bucket);
+    key = HttpUtility.UrlDecode(key);
+    var query = context.Request.Query;
+
+    // Initiate Multipart Upload
+    if (query.ContainsKey("uploads"))
+    {
+        var metadata = new Dictionary<string, string>();
+        var contentType = context.Request.ContentType ?? "application/octet-stream";
+        
+        foreach (var header in context.Request.Headers)
+        {
+            if (header.Key.StartsWith("x-amz-meta-", StringComparison.OrdinalIgnoreCase))
+            {
+                metadata[header.Key] = header.Value.ToString();
+            }
+        }
+
+        // Note: We'll use a temporary path for initiation, actual backend selection happens during completion
+        var uploadId = multipartUploadManager.InitiateUpload(bucket, key, "/tmp", metadata, contentType);
+        return Results.Content(
+            S3XmlHelper.CreateInitiateMultipartUploadResponse(bucket, key, uploadId),
+            "application/xml"
+        );
+    }
+
+    // Complete Multipart Upload
+    if (query.ContainsKey("uploadId"))
+    {
+        var uploadId = query["uploadId"].ToString();
+        var upload = multipartUploadManager.GetUpload(uploadId);
+        
+        if (upload == null)
+        {
+            return Results.Content(
+                S3XmlHelper.CreateErrorResponse("NoSuchUpload", "指定されたマルチパートアップロードは存在しません", $"/{bucket}/{key}"),
+                "application/xml",
+                statusCode: 404
+            );
+        }
+
+        // Parse request body to get the list of parts
+        using var reader = new StreamReader(context.Request.Body);
+        var body = await reader.ReadToEndAsync();
+        
+        var parts = new List<UploadPart>();
+        try
+        {
+            var doc = System.Xml.Linq.XDocument.Parse(body);
+            var ns = doc.Root?.Name.Namespace ?? "";
+            
+            foreach (var partElem in doc.Descendants(ns + "Part"))
+            {
+                var partNumber = int.Parse(partElem.Element(ns + "PartNumber")?.Value ?? "0");
+                var etag = partElem.Element(ns + "ETag")?.Value?.Trim('"') ?? "";
+                
+                var existingPart = upload.Parts.FirstOrDefault(p => p.PartNumber == partNumber && p.ETag == etag);
+                if (existingPart != null)
+                {
+                    parts.Add(existingPart);
+                }
+            }
+        }
+        catch
+        {
+            return Results.Content(
+                S3XmlHelper.CreateErrorResponse("MalformedXML", "提供されたXMLは整形式ではありません", $"/{bucket}/{key}"),
+                "application/xml",
+                statusCode: 400
+            );
+        }
+
+        if (multipartUploadManager.CompleteUpload(uploadId, parts, out var tempFilePath))
+        {
+            try
+            {
+                // Read the completed file and use existing WriteFileWithFallbackAsync
+                var fileContent = await File.ReadAllBytesAsync(tempFilePath);
+                var relativePath = Path.Combine(bucket, key);
+                var success = await backendManager.WriteFileWithFallbackAsync(relativePath, fileContent);
+                
+                if (!success)
+                {
+                    return Results.Content(
+                        S3XmlHelper.CreateErrorResponse("ServiceUnavailable", "利用可能なバックエンドがありません", $"/{bucket}/{key}"),
+                        "application/xml",
+                        statusCode: 503
+                    );
+                }
+
+                // Generate ETag for the completed file
+                var etag = ETagService.ComputeETag(key, fileContent.Length, DateTime.UtcNow);
+                
+                var location = $"{context.Request.Scheme}://{context.Request.Host}/{bucket}/{key}";
+                return Results.Content(
+                    S3XmlHelper.CreateCompleteMultipartUploadResponse(location, bucket, key, etag),
+                    "application/xml"
+                );
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "マルチパートアップロード完了後のファイル保存に失敗しました: {Bucket}/{Key}", bucket, key);
+                return Results.Content(
+                    S3XmlHelper.CreateErrorResponse("InternalError", "ファイルの保存に失敗しました", $"/{bucket}/{key}"),
+                    "application/xml",
+                    statusCode: 500
+                );
+            }
+        }
+
+        return Results.Content(
+            S3XmlHelper.CreateErrorResponse("InternalError", "マルチパートアップロードの完了に失敗しました", $"/{bucket}/{key}"),
+            "application/xml",
+            statusCode: 500
+        );
+    }
+
+    return Results.BadRequest();
 });
 
 app.Run();

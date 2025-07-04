@@ -1,4 +1,5 @@
 using System.Xml.Linq;
+using Stratify.S3.Models;
 
 namespace Stratify.S3.Helpers;
 
@@ -61,6 +62,69 @@ public static class S3XmlHelper
             new XElement("Message", message),
             new XElement("Resource", resource),
             new XElement("RequestId", Guid.NewGuid().ToString())
+        );
+
+        return FormatXml(root);
+    }
+
+    public static string CreateInitiateMultipartUploadResponse(string bucket, string key, string uploadId)
+    {
+        var root = new XElement(XName.Get("InitiateMultipartUploadResult", S3Namespace),
+            new XElement("Bucket", bucket),
+            new XElement("Key", key),
+            new XElement("UploadId", uploadId)
+        );
+
+        return FormatXml(root);
+    }
+
+    public static string CreateCompleteMultipartUploadResponse(string location, string bucket, string key, string etag)
+    {
+        var root = new XElement(XName.Get("CompleteMultipartUploadResult", S3Namespace),
+            new XElement("Location", location),
+            new XElement("Bucket", bucket),
+            new XElement("Key", key),
+            new XElement("ETag", $"\"{etag}\"")
+        );
+
+        return FormatXml(root);
+    }
+
+    public static string CreateListPartsResponse(
+        string bucket,
+        string key,
+        string uploadId,
+        int partNumberMarker,
+        int nextPartNumberMarker,
+        int maxParts,
+        bool isTruncated,
+        List<UploadPart> parts)
+    {
+        var root = new XElement(XName.Get("ListPartsResult", S3Namespace),
+            new XElement("Bucket", bucket),
+            new XElement("Key", key),
+            new XElement("UploadId", uploadId),
+            new XElement("PartNumberMarker", partNumberMarker),
+            new XElement("NextPartNumberMarker", nextPartNumberMarker),
+            new XElement("MaxParts", maxParts),
+            new XElement("IsTruncated", isTruncated.ToString().ToLower()),
+            new XElement("StorageClass", "STANDARD"),
+            new XElement("Initiator",
+                new XElement("ID", "s3proxy"),
+                new XElement("DisplayName", "S3 Proxy")
+            ),
+            new XElement("Owner",
+                new XElement("ID", "s3proxy"),
+                new XElement("DisplayName", "S3 Proxy")
+            ),
+            parts.Select(part =>
+                new XElement("Part",
+                    new XElement("PartNumber", part.PartNumber),
+                    new XElement("LastModified", part.LastModified.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")),
+                    new XElement("ETag", $"\"{part.ETag}\""),
+                    new XElement("Size", part.Size)
+                )
+            )
         );
 
         return FormatXml(root);
