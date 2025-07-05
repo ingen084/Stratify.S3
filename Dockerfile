@@ -18,21 +18,11 @@ RUN dotnet publish "Stratify.S3.csproj" -c Release -o /app/publish /p:UseAppHost
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final
 WORKDIR /app
 
-# 非rootユーザーを作成
-RUN groupadd -g 1000 stratify && \
-    useradd -r -u 1000 -g stratify stratify
-
 # ストレージディレクトリを作成
-RUN mkdir -p /storage/primary /storage/secondary /storage/archive && \
-    chown -R stratify:stratify /storage
+RUN mkdir -p /storage/primary /storage/secondary /storage/archive
 
 # アプリケーションファイルをコピー
 COPY --from=publish /app/publish .
-RUN chown -R stratify:stratify /app
-
-# 非rootユーザーに切り替え
-USER stratify
-
 # ポート設定
 EXPOSE 8080
 ENV ASPNETCORE_URLS=http://+:8080
