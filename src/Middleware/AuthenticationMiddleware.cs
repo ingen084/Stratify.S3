@@ -38,6 +38,7 @@ public class AuthenticationMiddleware
             if (!string.IsNullOrEmpty(adminAuthResult.UserName))
             {
                 context.Items["User"] = adminAuthResult.UserName;
+                context.Items["UserPermissions"] = adminAuthResult.Permissions;
                 context.Items["IsAdmin"] = true;
             }
             
@@ -57,6 +58,7 @@ public class AuthenticationMiddleware
         if (!string.IsNullOrEmpty(authResult.UserName))
         {
             context.Items["User"] = authResult.UserName;
+            context.Items["UserPermissions"] = authResult.Permissions;
         }
 
         await _next(context);

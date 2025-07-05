@@ -63,7 +63,7 @@ public class AuthenticationService
         }
 
         _logger.LogInformation("APIキー認証が成功しました: {KeyName}", keyConfig.Name);
-        return Task.FromResult(AuthResult.Success(keyConfig.Name));
+        return Task.FromResult(AuthResult.Success(keyConfig.Name, keyConfig.AllowedOperations));
     }
 
     private async Task<AuthResult> AuthenticateAwsSignatureAsync(string authHeader, HttpContext context)
@@ -105,7 +105,7 @@ public class AuthenticationService
             }
 
             _logger.LogInformation("AWS署名認証が成功しました: {Name}", credential.Name);
-            return AuthResult.Success(credential.Name);
+            return AuthResult.Success(credential.Name, credential.AllowedOperations);
         }
         catch (Exception ex)
         {
@@ -139,14 +139,16 @@ public class AuthenticationService
     {
         try
         {
-            // 簡略化されたAWS Signature V4検証
-            // 実際の実装では、より厳密な検証が必要
+            // AWS Signature V4の検証
             
             var dateHeader = request.Headers["X-Amz-Date"].FirstOrDefault() ?? 
                             request.Headers["Date"].FirstOrDefault();
             
             if (string.IsNullOrEmpty(dateHeader))
+            {
+                _logger.LogWarning("X-Amz-DateまたはDateヘッダーが見つかりません");
                 return false;
+            }
 
             // タイムスタンプの有効性チェック（15分以内）
             if (DateTime.TryParseExact(dateHeader, "yyyyMMddTHHmmssZ", null, 
@@ -159,14 +161,28 @@ public class AuthenticationService
                     return false;
                 }
             }
+            else
+            {
+                _logger.LogWarning("日付ヘッダーの形式が無効です: {DateHeader}", dateHeader);
+                return false;
+            }
 
-            // ここで実際の署名検証を行う
-            // 簡略化のため、基本的なチェックのみ実装
+            // 署名検証を実行
             var canonicalRequest = await BuildCanonicalRequestAsync(request, signatureData.SignedHeaders);
-            var stringToSign = BuildStringToSign(signatureData, canonicalRequest);
+            var stringToSign = BuildStringToSign(signatureData, canonicalRequest, dateHeader);
             var calculatedSignature = CalculateSignature(secretKey, signatureData, stringToSign);
 
-            return calculatedSignature.Equals(signatureData.Signature, StringComparison.OrdinalIgnoreCase);
+            var isValid = calculatedSignature.Equals(signatureData.Signature, StringComparison.OrdinalIgnoreCase);
+            
+            if (!isValid)
+            {
+                _logger.LogWarning("AWS署名の検証が失敗しました。計算された署名: {Calculated}, 提供された署名: {Provided}", 
+                    calculatedSignature, signatureData.Signature);
+                _logger.LogDebug("StringToSign: {StringToSign}", stringToSign);
+                _logger.LogDebug("CanonicalRequest: {CanonicalRequest}", canonicalRequest);
+            }
+
+            return isValid;
         }
         catch (Exception ex)
         {
@@ -179,7 +195,23 @@ public class AuthenticationService
     {
         var method = request.Method.ToUpperInvariant();
         var uri = request.Path.Value ?? "/";
-        var queryString = request.QueryString.Value ?? "";
+        
+        // クエリ文字列の正規化
+        var queryString = "";
+        if (!string.IsNullOrEmpty(request.QueryString.Value))
+        {
+            var queryParams = new List<string>();
+            var pairs = request.QueryString.Value.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var pair in pairs)
+            {
+                var keyValue = pair.Split('=', 2);
+                var key = Uri.EscapeDataString(keyValue[0]);
+                var value = keyValue.Length > 1 ? Uri.EscapeDataString(keyValue[1]) : "";
+                queryParams.Add($"{key}={value}");
+            }
+            queryParams.Sort();
+            queryString = string.Join("&", queryParams);
+        }
         
         var headers = new StringBuilder();
         var headerNames = signedHeaders.Split(';').OrderBy(h => h).ToArray();
@@ -187,25 +219,28 @@ public class AuthenticationService
         foreach (var headerName in headerNames)
         {
             var headerValue = request.Headers[headerName].FirstOrDefault() ?? "";
-            headers.AppendLine($"{headerName.ToLowerInvariant()}:{headerValue.Trim()}");
+            // ヘッダー値の正規化（連続する空白を1つの空白に）
+            headerValue = System.Text.RegularExpressions.Regex.Replace(headerValue.Trim(), @"\s+", " ");
+            headers.Append($"{headerName.ToLowerInvariant()}:{headerValue}\n");
         }
 
-        var hashedPayload = "UNSIGNED-PAYLOAD"; // 簡略化
-        if (request.ContentLength.HasValue && request.ContentLength > 0)
+        // ペイロードハッシュを取得（通常はX-Amz-Content-Sha256ヘッダーから）
+        var hashedPayload = request.Headers["X-Amz-Content-Sha256"].FirstOrDefault() ?? "UNSIGNED-PAYLOAD";
+        if (string.IsNullOrEmpty(hashedPayload))
         {
-            // 実際の実装では、リクエストボディのハッシュを計算
-            hashedPayload = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+            hashedPayload = "UNSIGNED-PAYLOAD";
         }
 
-        return Task.FromResult($"{method}\n{uri}\n{queryString}\n{headers}\n{signedHeaders}\n{hashedPayload}");
+        var canonicalRequest = $"{method}\n{uri}\n{queryString}\n{headers}\n{signedHeaders}\n{hashedPayload}";
+        return Task.FromResult(canonicalRequest);
     }
 
-    private string BuildStringToSign(AwsSignatureData signatureData, string canonicalRequest)
+    private string BuildStringToSign(AwsSignatureData signatureData, string canonicalRequest, string dateHeader)
     {
         var hashedCanonicalRequest = ComputeSHA256Hash(canonicalRequest);
         var scope = $"{signatureData.Date}/{signatureData.Region}/{signatureData.Service}/{signatureData.RequestType}";
         
-        return $"AWS4-HMAC-SHA256\n{signatureData.Date}T000000Z\n{scope}\n{hashedCanonicalRequest}";
+        return $"AWS4-HMAC-SHA256\n{dateHeader}\n{scope}\n{hashedCanonicalRequest}";
     }
 
     private string CalculateSignature(string secretKey, AwsSignatureData signatureData, string stringToSign)
@@ -265,7 +300,7 @@ public class AuthenticationService
         }
 
         _logger.LogInformation("管理APIキー認証が成功しました: {KeyName}", keyConfig.Name);
-        return Task.FromResult(AuthResult.Success(keyConfig.Name));
+        return Task.FromResult(AuthResult.Success(keyConfig.Name, keyConfig.AllowedOperations));
     }
 
     private string GetOperationFromRequest(HttpRequest request)
@@ -303,11 +338,13 @@ public class AuthResult
     public bool IsAuthenticated { get; set; }
     public string? UserName { get; set; }
     public string? ErrorMessage { get; set; }
+    public string[] Permissions { get; set; } = Array.Empty<string>();
 
-    public static AuthResult Success(string? userName = null) => new()
+    public static AuthResult Success(string? userName = null, string[]? permissions = null) => new()
     {
         IsAuthenticated = true,
-        UserName = userName
+        UserName = userName,
+        Permissions = permissions ?? Array.Empty<string>()
     };
 
     public static AuthResult Failure(string errorMessage) => new()

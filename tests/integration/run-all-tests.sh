@@ -13,6 +13,7 @@ TEST_SUITES=(
     "test-basic-operations.sh"
     "test-multipart-upload.sh"
     "test-failover.sh"
+    "test-authentication.sh"
 )
 
 # Statistics

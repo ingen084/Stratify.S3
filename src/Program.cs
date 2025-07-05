@@ -48,11 +48,48 @@ foreach (var backend in backends)
     }
 }
 
+// Permission check helper functions
+static bool CheckPermission(HttpContext context, string requiredOperation, string bucket = "*")
+{
+    // Admin operations always require admin permission
+    if (requiredOperation == "admin")
+    {
+        return context.Items.ContainsKey("IsAdmin") && (bool)context.Items["IsAdmin"];
+    }
+    
+    // Get user permissions from context (set by authentication middleware)
+    if (context.Items.TryGetValue("UserPermissions", out var permissionsObj) && 
+        permissionsObj is string[] permissions)
+    {
+        return permissions.Contains("*") || permissions.Contains(requiredOperation);
+    }
+    
+    // Fallback: check if user is authenticated
+    var user = context.Items["User"] as string;
+    return !string.IsNullOrEmpty(user);
+}
+
+static IResult PermissionDenied(string operation, string resource)
+{
+    return Results.Content(
+        S3XmlHelper.CreateErrorResponse("AccessDenied", 
+            $"Operation '{operation}' not permitted on resource '{resource}'", 
+            resource),
+        "application/xml",
+        statusCode: 403
+    );
+}
+
 // S3 API Endpoints
 
 // ListBuckets
-app.MapGet("/", async () =>
+app.MapGet("/", async (HttpContext context) =>
 {
+    // Check read permission
+    if (!CheckPermission(context, "read", "*"))
+    {
+        return PermissionDenied("read", "/");
+    }
     try
     {
         var bucketNames = await backendManager.GetAllBucketsAsync();
@@ -94,12 +131,18 @@ app.MapGet("/", async () =>
 });
 
 // ListObjects
-app.MapGet("/{bucket}", async (string bucket, string? prefix, string? delimiter, int? maxKeys, string? marker) =>
+app.MapGet("/{bucket}", async (string bucket, string? prefix, string? delimiter, int? maxKeys, string? marker, HttpContext context) =>
 {
     bucket = HttpUtility.UrlDecode(bucket);
     prefix = HttpUtility.UrlDecode(prefix ?? "");
     maxKeys ??= 1000;
     marker ??= "";
+    
+    // Check read permission
+    if (!CheckPermission(context, "read", bucket))
+    {
+        return PermissionDenied("read", $"/{bucket}");
+    }
 
     try
     {
@@ -169,6 +212,12 @@ app.MapMethods("/{bucket}/{**key}", ["HEAD"], async (string bucket, string key, 
     bucket = HttpUtility.UrlDecode(bucket);
     key = HttpUtility.UrlDecode(key);
     
+    // Check read permission
+    if (!CheckPermission(context, "read", bucket))
+    {
+        return PermissionDenied("read", $"/{bucket}/{key}");
+    }
+    
     logger.LogInformation("Processing HEAD request for {Bucket}/{Key}", bucket, key);
     var relativePath = Path.Combine(bucket, key);
     var fileLocation = await backendManager.FindFileWithFallbackAsync(relativePath);
@@ -195,6 +244,12 @@ app.MapGet("/{bucket}/{**key}", async (string bucket, string key, HttpContext co
 {
     bucket = HttpUtility.UrlDecode(bucket);
     key = HttpUtility.UrlDecode(key);
+    
+    // Check read permission
+    if (!CheckPermission(context, "read", bucket))
+    {
+        return PermissionDenied("read", $"/{bucket}/{key}");
+    }
     
     // Check if this is a List Parts request
     if (context.Request.Query.ContainsKey("uploadId"))
@@ -318,6 +373,12 @@ app.MapGet("/{bucket}/{**key}", async (string bucket, string key, HttpContext co
 // Create Bucket (must be before PutObject endpoint)
 app.MapPut("/{bucket:regex(^[a-z0-9.-]{{3,63}}$)}", async (string bucket, HttpContext context) =>
 {
+    // Check write permission for bucket creation
+    if (!CheckPermission(context, "write", bucket))
+    {
+        return PermissionDenied("write", $"/{bucket}");
+    }
+    
     // Ensure this is a bucket creation request (no additional path segments)
     var path = context.Request.Path.Value;
     if (path != null && path.Count(c => c == '/') == 1) // Only one slash (bucket name only)
@@ -373,6 +434,12 @@ app.MapPut("/{bucket}/{**key}", async (string bucket, string key, HttpContext co
 {
     bucket = HttpUtility.UrlDecode(bucket);
     key = HttpUtility.UrlDecode(key);
+    
+    // Check write permission
+    if (!CheckPermission(context, "write", bucket))
+    {
+        return PermissionDenied("write", $"/{bucket}/{key}");
+    }
 
     // Check if this is an Upload Part request
     var query = context.Request.Query;
@@ -467,6 +534,12 @@ app.MapPut("/{bucket}/{**key}", async (string bucket, string key, HttpContext co
 // Delete Bucket (must be before DeleteObject endpoint)
 app.MapDelete("/{bucket:regex(^[a-z0-9.-]{{3,63}}$)}", async (string bucket, HttpContext context) =>
 {
+    // Check delete permission
+    if (!CheckPermission(context, "delete", bucket))
+    {
+        return PermissionDenied("delete", $"/{bucket}");
+    }
+    
     // Ensure this is a bucket deletion request (no additional path segments)
     var path = context.Request.Path.Value;
     if (path != null && path.Count(c => c == '/') == 1) // Only one slash (bucket name only)
@@ -553,6 +626,12 @@ app.MapDelete("/{bucket}/{**key}", async (string bucket, string key, HttpContext
 {
     bucket = HttpUtility.UrlDecode(bucket);
     key = HttpUtility.UrlDecode(key);
+    
+    // Check delete permission
+    if (!CheckPermission(context, "delete", bucket))
+    {
+        return PermissionDenied("delete", $"/{bucket}/{key}");
+    }
     
     // Check if this is an Abort Multipart Upload request
     if (context.Request.Query.ContainsKey("uploadId"))

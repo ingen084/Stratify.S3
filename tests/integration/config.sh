@@ -51,6 +51,19 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Color functions for cleaner output
+color_blue() {
+    echo -e "${BLUE}$1${NC}"
+}
+
+color_green() {
+    echo -e "${GREEN}$1${NC}"
+}
+
+color_red() {
+    echo -e "${RED}$1${NC}"
+}
+
 # AWS CLI wrapper with endpoint
 aws_s3() {
     aws --endpoint-url "$S3_ENDPOINT_URL" s3 "$@"
